@@ -17,6 +17,7 @@ class Sankey extends IPSModule
         $this->RegisterVariableInteger('EndDate',   'Enddatum',   '~UnixTimestamp', 11);
         $this->EnableAction('StartDate');
         $this->EnableAction('EndDate');
+        $this->EnableAction('ToggleMode');
 
         $this->SetVisualizationType(1);
     }
@@ -49,23 +50,38 @@ class Sankey extends IPSModule
             }
         }
 
-        // Im Live-Modus Variablen überwachen
-        if (!$staticMode) {
-            $links = json_decode($this->ReadPropertyString('Links'), true) ?? [];
-            foreach ($links as $link) {
-                $varID = intval($link['VariableID'] ?? 0);
-                if ($varID > 0 && IPS_VariableExists($varID)) {
-                    $this->RegisterMessage($varID, VM_UPDATE);
-                }
+        // Im Archivmodus entscheidet MessageSink(), ob der gewählte Zeitraum aktualisiert werden muss.
+        $links = json_decode($this->ReadPropertyString('Links'), true) ?? [];
+
+        foreach ($links as $link) {
+            $varID = intval($link['VariableID'] ?? 0);
+
+            if ($varID > 0 && IPS_VariableExists($varID)) {
+                $this->RegisterMessage($varID, VM_UPDATE);
+            }
+
+            $infoVarID = intval($link['InfoVariableID'] ?? 0);
+
+            if ($infoVarID > 0 && IPS_VariableExists($infoVarID)) {
+                $this->RegisterMessage($infoVarID, VM_UPDATE);
             }
         }
 
-        $this->UpdateVisualizationValue($this->GetVisualizationTile());
+        $this->UpdateVisualizationValue(json_encode($this->CollectData(), JSON_UNESCAPED_UNICODE));
     }
 
     public function MessageSink($TimeStamp, $SenderID, $Message, $Data): void
     {
-        if ($Message === VM_UPDATE) {
+        if ($Message !== VM_UPDATE) {
+            return;
+        }
+
+        if (!$this->ReadPropertyBoolean('StaticMode')) {
+            $this->UpdateDiagram();
+            return;
+        }
+
+        if ($this->IsCurrentTimeInsideSelectedRange()) {
             $this->UpdateDiagram();
         }
     }
@@ -75,6 +91,16 @@ class Sankey extends IPSModule
         if ($Ident === 'StartDate' || $Ident === 'EndDate') {
             SetValue($this->GetIDForIdent($Ident), $Value);
             $this->UpdateDiagram();
+            return;
+        }
+
+        if ($Ident === 'ToggleMode') {
+            $newMode = intval($Value) === 1;
+
+            IPS_SetProperty($this->InstanceID, 'StaticMode', $newMode);
+            IPS_ApplyChanges($this->InstanceID);
+
+            return;
         }
     }
 
@@ -89,6 +115,19 @@ class Sankey extends IPSModule
     }
 
     // --- private ---
+
+    private function IsCurrentTimeInsideSelectedRange(): bool
+    {
+        $startTime = (int) GetValue($this->GetIDForIdent('StartDate'));
+        $endTime   = (int) GetValue($this->GetIDForIdent('EndDate'));
+        $now       = time();
+
+        if ($startTime <= 0 || $endTime <= 0) {
+            return false;
+        }
+
+        return $startTime <= $now && $endTime >= $now;
+    }
 
     private function GetVariableUnit(int $varID): string
     {
@@ -194,6 +233,7 @@ class Sankey extends IPSModule
             $source = trim($link['Source'] ?? '');
             $target = trim($link['Target'] ?? '');
             $varID  = intval($link['VariableID'] ?? 0);
+            $infoVarID = intval($link['InfoVariableID'] ?? 0);
 
             if ($source === '' || $target === '' || $varID <= 0 || !IPS_VariableExists($varID)) {
                 continue;
@@ -242,11 +282,40 @@ class Sankey extends IPSModule
 
                 $unit = $this->GetVariableUnit($varID);
 
+                $infoText = '';
+
+                if ($infoVarID > 0 && IPS_VariableExists($infoVarID)) {
+                    if ($staticMode) {
+                        $infoValues = $this->GetValuesFromArchive($infoVarID, $startTime, $endTime);
+                        $infoValue = 0.0;
+
+                        foreach ($infoValues as $infoEntry) {
+                            $infoValue += floatval($infoEntry['value']);
+                        }
+                    } else {
+                        $infoValue = abs(floatval(GetValue($infoVarID)));
+                    }
+
+                    $infoVar = IPS_GetVariable($infoVarID);
+
+                    $profileName = $infoVar['VariableCustomProfile'] !== ''
+                        ? $infoVar['VariableCustomProfile']
+                        : $infoVar['VariableProfile'];
+
+                    if ($profileName !== '' && IPS_VariableProfileExists($profileName)) {
+                        $infoText = GetValueFormattedEx($infoVarID, $infoValue);
+                    } else {
+                        $infoUnit = $this->GetVariableUnit($infoVarID);
+                        $infoText = number_format($infoValue, 2, ',', "'") . ($infoUnit !== '' ? ' ' . $infoUnit : '');
+                    }
+                }
+
                 $rows[] = [
                     htmlspecialchars($rowSource, ENT_QUOTES, 'UTF-8'),
                     htmlspecialchars($rowTarget, ENT_QUOTES, 'UTF-8'),
                     $value,
                     $unit,
+                    $infoText,
                 ];
 
                 $color = intval($link['Color'] ?? 0);
@@ -431,9 +500,10 @@ class Sankey extends IPSModule
 <body>
 <div id="chart_div"></div>
 <div id="date_range">
-    <input type="date" id="inp_start" class="dp-input">
+    <button id="btn_mode" class="dp-input">Archiv</button>
+    <input type="datetime-local" id="inp_start" class="dp-input">
     <span class="dp-sep">→</span>
-    <input type="date" id="inp_end" class="dp-input">
+    <input type="datetime-local" id="inp_end" class="dp-input">
 </div>
 <script>{$sankeyJS}</script>
 <script>
@@ -445,27 +515,54 @@ class Sankey extends IPSModule
 
     function tsToInputVal(ts) {
         if (!ts) return '';
+
         var d = new Date(ts * 1000);
+
         return d.getFullYear() + '-' +
             String(d.getMonth() + 1).padStart(2, '0') + '-' +
-            String(d.getDate()).padStart(2, '0');
+            String(d.getDate()).padStart(2, '0') + 'T' +
+            String(d.getHours()).padStart(2, '0') + ':' +
+            String(d.getMinutes()).padStart(2, '0');
     }
 
     function dateToTs(val) {
         if (!val) return 0;
-        var p = val.split('-');
-        return Math.floor(new Date(+p[0], +p[1] - 1, +p[2]).getTime() / 1000);
+
+        var d = new Date(val);
+
+        return Math.floor(d.getTime() / 1000);
     }
 
     function updateDateRange() {
         var el = document.getElementById('date_range');
         if (!el) return;
+
+        var btn = document.getElementById('btn_mode');
+        if (btn) {
+            btn.textContent = staticMode ? 'Archiv' : 'Live';
+        }
+
+        el.style.display = 'flex';
+
+        document.getElementById('inp_start').style.display = staticMode ? 'inline-block' : 'none';
+        document.getElementById('inp_end').style.display   = staticMode ? 'inline-block' : 'none';
+
+        var sep = document.querySelector('.dp-sep');
+        if (sep) {
+            sep.style.display = staticMode ? 'inline-block' : 'none';
+        }
+
         if (staticMode) {
-            el.style.display = 'flex';
-            document.getElementById('inp_start').value = tsToInputVal(startTs);
-            document.getElementById('inp_end').value   = tsToInputVal(endTs);
-        } else {
-            el.style.display = 'none';
+            var inpStart = document.getElementById('inp_start');
+            var inpEnd   = document.getElementById('inp_end');
+
+            if (document.activeElement !== inpStart) {
+                inpStart.value = tsToInputVal(startTs);
+            }
+
+            if (document.activeElement !== inpEnd) {
+                inpEnd.value = tsToInputVal(endTs);
+            }
         }
     }
 
@@ -505,6 +602,11 @@ class Sankey extends IPSModule
         endTs = dateToTs(this.value);
         requestAction('EndDate', endTs);
     });
+
+    document.getElementById('btn_mode').addEventListener('click', function () {
+            var newMode = staticMode ? 0 : 1;
+            requestAction('ToggleMode', newMode);
+        });
 
     window.addEventListener('message', function(event) {
         handleMessage(event.data);

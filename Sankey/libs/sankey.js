@@ -15,7 +15,14 @@
     }
 
     function makeTooltip(container) {
+        var existing = container.querySelector('.sankey-tooltip');
+        if (existing) {
+            return existing;
+        }
+
         var tip = document.createElement('div');
+        tip.className = 'sankey-tooltip';
+
         tip.style.cssText = [
             'position:absolute',
             'display:none',
@@ -31,9 +38,10 @@
             'box-shadow:0 2px 8px rgba(0,0,0,0.25)',
             'z-index:999'
         ].join(';');
-        /* Container muss position:relative haben damit absolute klappt */
+
         var pos = window.getComputedStyle(container).position;
         if (pos === 'static') container.style.position = 'relative';
+
         container.appendChild(tip);
         return tip;
     }
@@ -87,12 +95,13 @@
         /* ── Build graph ─────────────────────────────────────────────── */
         var nodeMap = Object.create(null);
         var links = rows.map(function (r) {
-            var s = String(r[0]), t = String(r[1]), v = Number(r[2]), u = r[3] ? String(r[3]) : '';
+            var s = String(r[0]), t = String(r[1]), v = Number(r[2]), u = r[3] ? String(r[3]) : '', info = r[4] ? String(r[4]) : '';
             if (!nodeMap[s]) nodeMap[s] = { id: s, inV: 0, outV: 0, col: -1 };
             if (!nodeMap[t]) nodeMap[t] = { id: t, inV: 0, outV: 0, col: -1 };
             nodeMap[s].outV += v;
             nodeMap[t].inV  += v;
-            return { s: s, t: t, v: v, u: u };
+            var info = r[4] ? String(r[4]) : '';
+            return { s: s, t: t, v: v, u: u, info: info };
         });
         var nodes = Object.keys(nodeMap).map(function (k) { return nodeMap[k]; });
 
@@ -174,11 +183,16 @@
         var tip = makeTooltip(container);
 
         /* Track mouse position relative to container */
-        var mouseX = 0, mouseY = 0;
+        var mouseX = container.__sankeyMouseX || 0;
+        var mouseY = container.__sankeyMouseY || 0;
+
         svg.addEventListener('mousemove', function (e) {
             var rect = container.getBoundingClientRect();
             mouseX = e.clientX - rect.left;
             mouseY = e.clientY - rect.top;
+
+            container.__sankeyMouseX = mouseX;
+            container.__sankeyMouseY = mouseY;
         });
 
         /* ── Links ───────────────────────────────────────────────────── */
@@ -216,12 +230,12 @@
             path.addEventListener('mouseenter', function () {
                 path.setAttribute('fill-opacity', Math.min(1, o.linkOpacity * 2));
                 showTip(tip, svg,
-                    '<b>' + l.s + '</b> &rarr; <b>' + l.t + '</b><br>' + fmt(l.v) + (l.u ? '&nbsp;' + l.u : ''),
+                    '<b>' + l.s + '</b> &rarr; <b>' + l.t + '</b><br>' + fmt(l.v) + (l.u ? '&nbsp;' + l.u : '') + (l.info ? ' (' + l.info + ')' : ''),
                     mouseX, mouseY);
             });
             path.addEventListener('mousemove', function () {
                 showTip(tip, svg,
-                    '<b>' + l.s + '</b> &rarr; <b>' + l.t + '</b><br>' + fmt(l.v) + (l.u ? '&nbsp;' + l.u : ''),
+                    '<b>' + l.s + '</b> &rarr; <b>' + l.t + '</b><br>' + fmt(l.v) + (l.u ? '&nbsp;' + l.u : '') + (l.info ? ' (' + l.info + ')' : ''),
                     mouseX, mouseY);
             });
             path.addEventListener('mouseleave', function () {
@@ -272,23 +286,57 @@
                 fill:           o.labelColor,
                 'pointer-events': 'none'
             });
-            t.textContent = n.id;
+            t.textContent = n.id.endsWith('-')
+                ? n.id.slice(0, -1)
+                : n.id;
 
             if (o.showValues) {
                 var dispVal = Math.max(n.inV, n.outV);
 
+                var nodeInfo = '';
+
+                links.forEach(function(l) {
+                    // Keine Zusatzinfo bei Sammel-/Durchgangs-Nodes in der Mitte
+                    if (n.inV > 0 && n.outV > 0) {
+                        return;
+                    }
+
+                    // Links: Node ist Quelle
+                    if (!nodeInfo && l.s === n.id && l.info) {
+                        nodeInfo = l.info;
+                    }
+
+                    // Rechts: Node ist Ziel
+                    if (!nodeInfo && l.t === n.id && l.info) {
+                        nodeInfo = l.info;
+                    }
+                });
+
+                var displayName = n.id.endsWith('-')
+                    ? n.id.slice(0, -1)
+                    : n.id;
+
                 t.textContent =
-                    n.id + '  ' +
+                    displayName + '  ' +
                     fmt(dispVal) +
-                    (nodeUnit ? ' ' + nodeUnit : '');
+                    (nodeUnit ? ' ' + nodeUnit : '') +
+                    (nodeInfo ? ' (' + nodeInfo + ')' : '');
             }
 
             svg.appendChild(t);
         });
 
-        container.innerHTML = '';
-        container.appendChild(tip);
-        container.appendChild(svg);
+        var oldSvg = container.querySelector('svg');
+
+        if (oldSvg) {
+            oldSvg.replaceWith(svg);
+        } else {
+            container.appendChild(svg);
+        }
+
+        if (!container.contains(tip)) {
+            container.appendChild(tip);
+        }
     }
 
     global.drawSankey = drawSankey;
